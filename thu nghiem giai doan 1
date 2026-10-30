@@ -1,0 +1,197 @@
+import csv
+import time
+import warnings
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.special import erfc
+from pyldpc import make_ldpc, decode
+
+#Cau hinh setup
+SEED = 42
+N_CODE, D_V, D_C, MAX_ITER = 120, 3, 6, 50
+EB_N0_DB_LIST = np.arange(0.0, 11.0, 1.0)
+TARGET_BIT_ERRORS_UNCODED, MAX_BITS_UNCODED = 1000, 50_000_000
+BITS_PER_BATCH_UNCODED = 10_000
+TARGET_FRAME_ERRORS, TARGET_BIT_ERRORS_BP, MAX_FRAMES = 50, 200, 5000
+BASELINE_CHECK_MAX_SNR, BASELINE_TOL_PERCENT = 8.0, 15.0
+DATA_DIR, FIGURE_DIR = Path("outputs/data"), Path("outputs/figures")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+
+def theoretical_bpsk_ber(eb_n0_db):
+    eb_n0 = 10.0 ** (np.asarray(eb_n0_db, dtype=float) / 10.0)
+    return 0.5 * erfc(np.sqrt(eb_n0))
+
+def save_csv(rows, filename):
+    if rows:
+        path = DATA_DIR / filename
+        with path.open("w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"CSV saved: {path.resolve()}")
+
+def create_ldpc_code():
+    H, G = make_ldpc(N_CODE, D_V, D_C, systematic=True, sparse=True, seed=SEED)
+    n, k = G.shape
+    hg = H @ G
+    hg = hg.toarray() if hasattr(hg, "toarray") else np.asarray(hg)
+    g0 = G[:k, :]
+    g0 = g0.toarray() if hasattr(g0, "toarray") else np.asarray(g0)
+    if np.any(np.asarray(hg, dtype=np.int64) % 2):
+        raise RuntimeError("Ma LDPC khong hop le: H @ G != 0 (mod 2).")
+    if not np.array_equal(g0.astype(int) % 2, np.eye(k, dtype=int)):
+        raise RuntimeError("G khong systematic tai k bit dau; dung dec[:k] khong hop le.")
+    rate = k / n
+    print(f"LDPC: H={H.shape}, G={G.shape}, n={n}, k={k}, R={rate:.4f}, MAX_ITER={MAX_ITER}")
+    return H, G, n, k, rate
+
+def simulate_uncoded(eb_list):
+    rng, rows = np.random.default_rng(SEED + 1), []
+    for eb_db in eb_list:
+        eb = 10.0 ** (float(eb_db) / 10.0)
+        sigma = np.sqrt(1.0 / (2.0 * eb))
+        errors = total_bits = 0
+        t0 = time.perf_counter()
+        while errors < TARGET_BIT_ERRORS_UNCODED and total_bits < MAX_BITS_UNCODED:
+            size = min(BITS_PER_BATCH_UNCODED, MAX_BITS_UNCODED - total_bits)
+            bits = rng.integers(0, 2, size=size, dtype=np.int8)
+            rx = 1.0 - 2.0 * bits.astype(float) + sigma * rng.standard_normal(size)
+            errors += int(np.count_nonzero(bits != (rx < 0).astype(np.int8)))
+            total_bits += size
+        ber = errors / total_bits if total_bits else float("nan")
+        theory = float(theoretical_bpsk_ber(eb_db))
+        diff = abs(ber - theory) / theory * 100.0 if np.isfinite(ber) else float("nan")
+        reached = errors >= TARGET_BIT_ERRORS_UNCODED
+        rows.append({"eb_n0_db": float(eb_db), "sigma2": float(sigma**2),
+                     "ber_sim": float(ber), "ber_theory": theory,
+                     "relative_error_percent": float(diff), "bit_errors": errors,
+                     "total_bits": total_bits, "target_reached": bool(reached),
+                     "runtime_s": time.perf_counter() - t0})
+        print(f"Uncoded {eb_db:4.1f} dB: BER={ber:.3e}, errors={errors}, bits={total_bits}, "
+              f"{'target reached' if reached else 'MAX_BITS reached'}")
+    return rows
+
+def simulate_bp_awgn(H, G, rate, eb_list):
+    rng, rows = np.random.default_rng(SEED + 2), []
+    n, k = G.shape
+    for eb_db in eb_list:
+        eb = 10.0 ** (float(eb_db) / 10.0)
+        sigma2 = 1.0 / (2.0 * rate * eb)  # Es=1; Eb=Es/R
+        sigma = np.sqrt(sigma2)
+        pyldpc_snr = 10.0 * np.log10(1.0 / sigma2)  # pyldpc var=10**(-snr/10)
+        bit_errors = info_frame_errors = cw_frame_errors = nonconverged = frames = 0
+        decode_time = 0.0
+        sim_t0 = time.perf_counter()
+
+        while (bit_errors < TARGET_BIT_ERRORS
+               or (frame_errors < TARGET_FRAME_ERRORS
+        )and frames < MAX_FRAMES):
+            msg = rng.integers(0, 2, size=k, dtype=np.int8)
+            cw = (np.asarray(G @ msg).reshape(-1).astype(np.int64) % 2).astype(np.int8)
+            rx = 1.0 - 2.0 * cw.astype(float) + sigma * rng.standard_normal(n)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", UserWarning)
+                t0 = time.perf_counter()
+                dec = np.asarray(decode(H, rx, snr=pyldpc_snr, maxiter=MAX_ITER)).reshape(-1).astype(np.int8)
+                decode_time += time.perf_counter() - t0
+            nonconverged += int(any("convergence" in str(w.message).lower() for w in caught))
+            info_err = int(np.count_nonzero(dec[:k] != msg))
+            bit_errors += info_err
+            info_frame_errors += int(info_err > 0)
+            cw_frame_errors += int(np.any(dec != cw))
+            frames += 1
+
+        sim_time = time.perf_counter() - sim_t0
+        total_info = frames * k
+        ber_info = bit_errors / total_info if total_info else float("nan")
+        fer_info = info_frame_errors / frames if frames else float("nan")
+        fer_cw = cw_frame_errors / frames if frames else float("nan")
+        ms_frame = decode_time / frames * 1000.0 if frames else float("nan")
+        throughput = total_info / decode_time if decode_time > 0 else 0.0
+        reached = (
+              bit_errors >= TARGET_BIT_ERRORS_BP
+              and cw_frame_errors >= TARGET_FRAME_ERRORS
+             )
+        rows.append({"eb_n0_db": float(eb_db), "pyldpc_snr_db": float(pyldpc_snr),
+                     "sigma2": float(sigma2), "code_rate": float(rate),
+                     "ber_information": float(ber_info), "fer_information": float(fer_info),
+                     "fer_codeword": float(fer_cw), "frames_run": frames,
+                     "codeword_frame_errors": cw_frame_errors, "information_frame_errors": info_frame_errors,
+                     "bit_errors": bit_errors, "total_information_bits": total_info,
+                     "target_reached": bool(reached), "nonconverged_frames": nonconverged,
+                     "decode_runtime_s": float(decode_time), "simulation_runtime_s": float(sim_time),
+                     "runtime_ms_per_frame": float(ms_frame), "information_throughput_bit_s": float(throughput),
+                     "uncoded_bpsk_theory_ber": float(theoretical_bpsk_ber(eb_db))})
+        print(f"BP {eb_db:4.1f} dB: BER_info={ber_info:.3e}, FER_cw={fer_cw:.3e}, "
+              f"frames={frames}, {ms_frame:.3f} ms/frame, nonconverged={nonconverged}, "
+              f"{'target reached' if reached else 'MAX_FRAMES reached'}")
+    return rows
+
+
+def verify_uncoded(rows):
+    print("\nVERIFY: uncoded BPSK simulation vs theory")
+    print(f"{'Eb/N0':>6} {'BER_sim':>12} {'BER_theory':>12} {'diff':>9} {'status':>22}")
+    all_ok = True
+    for r in rows:
+        snr, diff = r["eb_n0_db"], r["relative_error_percent"]
+        if snr > BASELINE_CHECK_MAX_SNR:
+            status = "SKIP (>8 dB)"
+        elif not r["target_reached"]:
+            status, all_ok = "WARN: sample cap", False
+        elif diff <= BASELINE_TOL_PERCENT:
+            status = "SANITY OK"
+        else:
+            status, all_ok = "WARN: diff > 15%", False
+        print(f"{snr:6.1f} {r['ber_sim']:12.3e} {r['ber_theory']:12.3e} {diff:8.2f}% {status:>22}")
+    print("Verification:", "PASS" if all_ok else "WARNING - inspect sample counts/statistics")
+    return all_ok
+
+
+def plot_results(uncoded, bp):
+    eu = np.array([r["eb_n0_db"] for r in uncoded])
+    eb = np.array([r["eb_n0_db"] for r in bp])
+    su = np.array([r["ber_sim"] for r in uncoded], dtype=float)
+    tu = np.array([r["ber_theory"] for r in uncoded], dtype=float)
+    bb = np.array([r["ber_information"] for r in bp], dtype=float)
+    fc = np.array([r["fer_codeword"] for r in bp], dtype=float)
+    rt = np.array([r["runtime_ms_per_frame"] for r in bp], dtype=float)
+
+    charts = [
+        ("ber_bp_awgn.png", "BER", True, [(eu, tu, "k--", "Uncoded theory"),
+         (eu, np.where(su > 0, su, np.nan), "ko", "Uncoded simulation"),
+         (eb, np.where(bb > 0, bb, np.nan), "rs-", "LDPC + BP information BER")]),
+        ("fer_bp_awgn.png", "FER", True, [(eb, np.where(fc > 0, fc, np.nan), "bo-", "BP codeword FER")]),
+        ("runtime_bp_awgn.png", "Runtime (ms/frame)", False, [(eb, rt, "^-", "BP decode time")]),
+    ]
+    for filename, ylabel, log_y, curves in charts:
+        plt.figure(figsize=(8, 5.5))
+        for x, y, style, label in curves:
+            (plt.semilogy if log_y else plt.plot)(x, y, style, label=label)
+        plt.xlabel(r"$E_b/N_0$ (dB)"); plt.ylabel(ylabel)
+        plt.title(filename.replace("_", " ").replace(".png", ""))
+        plt.grid(True, which="both" if log_y else "major", linestyle="--", alpha=0.4)
+        plt.legend(); plt.tight_layout()
+        path = FIGURE_DIR / filename
+        plt.savefig(path, dpi=250); plt.close()
+        print(f"Figure saved: {path.resolve()}")
+
+
+def main():
+    H, G, _, _, rate = create_ldpc_code()
+    uncoded = simulate_uncoded(EB_N0_DB_LIST)
+    save_csv(uncoded, "uncoded_bpsk_awgn.csv")
+    verify_uncoded(uncoded)  # Chi canh bao; khong bo qua cac ket qua LDPC neu co WARN.
+    bp = simulate_bp_awgn(H, G, rate, EB_N0_DB_LIST)
+    save_csv(bp, "ldpc_bp_awgn.csv")
+    plot_results(uncoded, bp)
+    print("\nDONE. Kiem tra outputs/data va outputs/figures.")
+    print("BER=0 nghia la chua quan sat thay loi; pyldpc khong tra actual iteration count.")
+
+
+if __name__ == "__main__":
+    main()
