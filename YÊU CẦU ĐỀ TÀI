@@ -1,0 +1,36 @@
+Hướng phát triển: Performance and Complexity Analysis of LDPC Decoders
+over AWGN and Rayleigh Fading Channels
+
+Mục tiêu:
+Mở rộng code LDPC hiện tại từ việc chỉ khảo sát pyldpc trên AWGN sang
+so sánh hiệu năng và độ phức tạp của các decoder khác nhau trên AWGN
+và Rayleigh fading.
+
+Nội dung cần thực hiện:
+* Giữ pyldpc/BP hiện tại làm baseline.
+* Kiểm tra lại baseline AWGN và normalization Eb/N0.
+* Bổ sung kênh flat Rayleigh fading với coherent detection/perfect CSI.
+* Tự cài đặt ít nhất Min-Sum và Normalized Min-Sum decoder.
+* Khảo sát một vài normalization factor cho Normalized Min-Sum.
+* Theo dõi syndrome convergence và actual number of iterations, không
+chỉ max iteration.
+* Chỉ cần chọn một vài cấu hình LDPC đại diện, không cần sweep quá
+nhiều block length/rate.
+* Nếu làm thêm được với QPSK.thì tốt
+
+Kết quả tối thiểu:
+* BER vs Eb/N0 trên AWGN cho BP, Min-Sum và Normalized Min-Sum.
+* BER vs Eb/N0 trên Rayleigh cho các decoder trên.
+* FER nếu có thể.
+* Coding gain tại một BER mục tiêu phù hợp.
+* Average iterations vs SNR.
+* Runtime/frame hoặc throughput của decoder.
+* So sánh normalization factor của Normalized Min-Sum.
+* Bảng performance-complexity trade-off.
+
+Trong báo cáo cần làm rõ:
+* BP baseline đang dùng là gì và pyldpc thực hiện stopping như thế nào.
+* Khác biệt thuật toán giữa BP, Min-Sum và Normalized Min-Sum.
+* Tại sao Min-Sum giảm complexity và khi nào performance loss trở nên đáng kể.
+* Sự khác nhau giữa AWGN và Rayleigh fading.
+* Phân tích cả BER và complexity, không chỉ BER.
