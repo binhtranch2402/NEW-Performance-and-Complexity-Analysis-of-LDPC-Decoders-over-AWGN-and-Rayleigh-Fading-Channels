@@ -15,16 +15,13 @@ from decoders import decode_min_sum
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
-# CẤU HÌNH (đồng bộ Giai đoạn 1) 
+# CAU HINH
 SEED = 42
-N_CODE, D_V, D_C = 120, 3, 6
-MAX_ITER = 50
+N_CODE, D_V, D_C, MAX_ITER = 120, 3, 6, 50
 EB_N0_DB_LIST = np.arange(0.0, 11.0, 1.0)
-
 TARGET_BIT_ERRORS = 200
 TARGET_FRAME_ERRORS = 50
 MAX_FRAMES = 5000
-
 ALPHA_FOR_NMS = 0.8
 
 DATA_DIR = Path("outputs/data")
