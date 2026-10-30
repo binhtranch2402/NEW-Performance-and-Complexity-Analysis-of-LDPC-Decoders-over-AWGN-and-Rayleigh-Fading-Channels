@@ -1,4 +1,3 @@
-"""Giai đoạn 2: So sánh BP (pyldpc), MS, NMS trên AWGN."""
 import csv
 import time
 import warnings
@@ -81,8 +80,8 @@ def simulate_one_decoder(H, G, rate, decoder_name):
         sim_t0 = time.perf_counter()
 
         while (bit_errors < TARGET_BIT_ERRORS
-               or cw_frame_errors < TARGET_FRAME_ERRORS
-               and frames < MAX_FRAMES):
+               or (frame_errors < TARGET_FRAME_ERRORS
+        )and frames < MAX_FRAMES):
             msg = rng.integers(0, 2, size=k, dtype=np.int8)
             cw = (np.asarray(G @ msg).reshape(-1).astype(np.int64)
                   % 2).astype(np.int8)
