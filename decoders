@@ -1,0 +1,193 @@
+"""
+Tự cài đặt Min-Sum và Normalized Min-Sum.
+Interface: decode_min_sum(H, llr_ch, max_iter, alpha=1.0) -> (bits, actual_iter, converged)
+    alpha = 1.0 → Min-Sum thuần
+    alpha < 1.0 → Normalized Min-Sum
+"""
+
+import operator
+import numpy as np
+from numba import njit
+from scipy.sparse import csr_matrix, issparse
+
+
+def prepare_edge_data(H):
+    """Build edge-index arrays from a binary parity-check matrix H."""
+    if issparse(H):
+        raw_data = np.asarray(H.data)
+        if raw_data.size:
+            try:
+                valid = np.isfinite(raw_data) & ((raw_data == 0) | (raw_data == 1))
+            except TypeError as exc:
+                raise ValueError("H must contain only binary values (0 or 1).") from exc
+            if not np.all(valid):
+                raise ValueError("H must contain only binary values (0 or 1).")
+        H_csr = csr_matrix(H, dtype=np.int64, copy=True)
+    else:
+        H_array = np.asarray(H)
+        if H_array.ndim != 2:
+            raise ValueError("H must be a two-dimensional matrix.")
+        try:
+            valid = np.isfinite(H_array) & ((H_array == 0) | (H_array == 1))
+        except TypeError as exc:
+            raise ValueError("H must contain only binary values (0 or 1).") from exc
+        if not np.all(valid):
+            raise ValueError("H must contain only binary values (0 or 1).")
+        H_csr = csr_matrix(H_array, dtype=np.int64)
+
+    # Duplicate 1s in sparse input cancel in GF(2); remove resulting zeros.
+    H_csr.sum_duplicates()
+    if H_csr.data.size:
+        H_csr.data %= 2
+    H_csr.eliminate_zeros()
+    H_csr.sort_indices()
+    m, n = H_csr.shape
+
+    edge_var = []
+    for c in range(m):
+        edge_var.extend(H_csr.indices[H_csr.indptr[c]:H_csr.indptr[c + 1]])
+    edge_var = np.asarray(edge_var, dtype=np.int64)
+    n_edges = len(edge_var)
+
+    check_start = np.zeros(m + 1, dtype=np.int64)
+    for c in range(m):
+        check_start[c + 1] = (check_start[c]
+                              + (H_csr.indptr[c + 1] - H_csr.indptr[c]))
+
+    edge_sorted_idx = np.argsort(edge_var, kind="stable")
+    counts = np.bincount(edge_var, minlength=n)
+    var_start = np.zeros(n + 1, dtype=np.int64)
+    var_start[1:] = np.cumsum(counts)
+
+    return {
+        "edge_var": edge_var,
+        "check_start": check_start,
+        "var_start": var_start,
+        "edge_sorted": edge_sorted_idx,
+        "n_edges": n_edges,
+        "m": m,
+        "n": n,
+    }
+
+@njit(cache=True)
+def _min_sum_core(edge_var, check_start, var_start,
+                  edge_sorted, n_edges, m, n, Lch, max_iter, alpha):
+    L_q = np.empty(n_edges)
+    L_r = np.zeros(n_edges)
+    L_Q = np.empty(n)
+    decoded = np.zeros(n, dtype=np.int64)
+    for v in range(n):
+        L_Q[v] = Lch[v]
+
+    for e in range(n_edges):
+        L_q[e] = Lch[edge_var[e]]
+
+    for it in range(max_iter):
+        # ---- Check node update (Min-Sum với min1/min2) ----
+        for c in range(m):
+            start = check_start[c]
+            end = check_start[c + 1]
+            deg = end - start
+            if deg == 0:
+                continue
+
+            sign_prod = 1.0
+            min1 = 1e30
+            min2 = 1e30
+            min1_idx = -1
+
+            for k in range(start, end):
+                v = L_q[k]
+                s = 1.0 if v >= 0.0 else -1.0
+                sign_prod *= s
+                av = abs(v)
+                if av < min1:
+                    min2 = min1
+                    min1 = av
+                    min1_idx = k
+                elif av < min2:
+                    min2 = av
+
+            for k in range(start, end):
+                s = 1.0 if L_q[k] >= 0.0 else -1.0
+                min_excl = min2 if k == min1_idx else min1
+                sign_excl = sign_prod * s
+                L_r[k] = alpha * sign_excl * min_excl
+
+        # ---- Variable node update ----
+        for v in range(n):
+            start = var_start[v]
+            end = var_start[v + 1]
+            if end <= start:
+                continue
+
+            sum_Lr = 0.0
+            for k in range(start, end):
+                e = edge_sorted[k]
+                sum_Lr += L_r[e]
+
+            L_Q[v] = Lch[v] + sum_Lr
+
+            for k in range(start, end):
+                e = edge_sorted[k]
+                L_q[e] = Lch[v] + sum_Lr - L_r[e]
+
+        # ---- Hard decision ----
+        for v in range(n):
+            decoded[v] = 1 if L_Q[v] < 0.0 else 0
+
+        # ---- Syndrome check ----
+        all_ok = True
+        for c in range(m):
+            start = check_start[c]
+            end = check_start[c + 1]
+            parity = 0
+            for k in range(start, end):
+                parity ^= decoded[edge_var[k]]
+            if parity != 0:
+                all_ok = False
+                break
+
+        if all_ok:
+            return decoded, it + 1, True
+
+    return decoded, max_iter, False
+
+
+def decode_min_sum(H, llr_ch, max_iter, alpha=1.0):
+    """Return (decoded_bits, actual_iter, converged)."""
+    data = prepare_edge_data(H)
+
+    try:
+        Lch = np.asarray(llr_ch, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("llr_ch must be a one-dimensional numeric array.") from exc
+    if Lch.ndim != 1:
+        raise ValueError("llr_ch must be one-dimensional.")
+    if Lch.size != data["n"]:
+        raise ValueError(f"llr_ch length ({Lch.size}) must match H columns ({data['n']}).")
+    if not np.all(np.isfinite(Lch)):
+        raise ValueError("llr_ch must contain only finite values.")
+
+    if isinstance(max_iter, (bool, np.bool_)):
+        raise ValueError("max_iter must be a positive integer.")
+    try:
+        max_iter_value = operator.index(max_iter)
+    except TypeError as exc:
+        raise ValueError("max_iter must be a positive integer.") from exc
+    if max_iter_value < 1:
+        raise ValueError("max_iter must be at least 1.")
+
+    try:
+        alpha_value = float(alpha)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("alpha must be a finite number in (0, 1].") from exc
+    if not np.isfinite(alpha_value) or not (0.0 < alpha_value <= 1.0):
+        raise ValueError("alpha must be a finite number in (0, 1].")
+
+    return _min_sum_core(
+        data["edge_var"], data["check_start"],
+        data["var_start"], data["edge_sorted"],
+        data["n_edges"], data["m"], data["n"],
+        np.ascontiguousarray(Lch), max_iter_value, alpha_value,
+    )
