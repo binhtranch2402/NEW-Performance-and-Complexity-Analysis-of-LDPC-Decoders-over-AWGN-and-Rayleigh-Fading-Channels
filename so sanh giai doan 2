@@ -1,0 +1,277 @@
+"""Giai đoạn 2: So sánh BP (pyldpc), MS, NMS trên AWGN."""
+import csv
+import time
+import warnings
+from pathlib import Path
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from scipy.special import erfc
+from pyldpc import make_ldpc, decode as pyldpc_decode
+
+from decoders import decode_min_sum
+
+warnings.filterwarnings('ignore', category=UserWarning)
+
+# CẤU HÌNH (đồng bộ Giai đoạn 1) 
+SEED = 42
+N_CODE, D_V, D_C = 120, 3, 6
+MAX_ITER = 50
+EB_N0_DB_LIST = np.arange(0.0, 11.0, 1.0)
+
+TARGET_BIT_ERRORS = 200
+TARGET_FRAME_ERRORS = 50
+MAX_FRAMES = 5000
+
+ALPHA_FOR_NMS = 0.8
+
+DATA_DIR = Path("outputs/data")
+FIGURE_DIR = Path("outputs/figures")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def theoretical_bpsk_ber(eb_n0_db):
+    eb = 10.0 ** (np.asarray(eb_n0_db, dtype=float) / 10.0)
+    return 0.5 * erfc(np.sqrt(eb))
+
+
+def save_csv(rows, filename):
+    path = DATA_DIR / filename
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"CSV saved: {path.resolve()}")
+
+
+def decode_bp(H, y, sigma2, max_iter):
+    """BP wrapper — giao diện tương đương decode_min_sum."""
+    snr_db = 10.0 * np.log10(1.0 / sigma2)
+    dec = np.asarray(pyldpc_decode(H, y, snr=snr_db,
+                                   maxiter=max_iter)).reshape(-1).astype(np.int8)
+    syndrome = np.asarray(H @ dec).reshape(-1)
+    converged = not np.any(syndrome % 2)
+    return dec, None, converged  # pyldpc không trả actual_iter
+
+
+def simulate_one_decoder(H, G, rate, decoder_name):
+    """Chạy mô phỏng cho 1 decoder, style Giai đoạn 1."""
+    n, k = G.shape
+    rows = []
+
+    print(f"\n[{decoder_name}]")
+    for snr_index, eb_n0_db in enumerate(EB_N0_DB_LIST):
+        # Identical message/noise streams for each decoder at a given SNR.
+        rng = np.random.default_rng(np.random.SeedSequence([SEED, snr_index]))
+        eb = 10.0 ** (float(eb_n0_db) / 10.0)
+        sigma2 = 1.0 / (2.0 * rate * eb)
+        sigma = np.sqrt(sigma2)
+
+        bit_errors = 0
+        frame_errors = 0
+        frames = 0
+        nonconv = 0
+        iter_sum = 0.0
+        iter_count = 0
+        decode_time = 0.0
+        sim_t0 = time.perf_counter()
+
+        while (bit_errors < TARGET_BIT_ERRORS
+               or cw_frame_errors < TARGET_FRAME_ERRORS
+               and frames < MAX_FRAMES):
+            msg = rng.integers(0, 2, size=k, dtype=np.int8)
+            cw = (np.asarray(G @ msg).reshape(-1).astype(np.int64)
+                  % 2).astype(np.int8)
+            rx = 1.0 - 2.0 * cw.astype(float) + sigma * rng.standard_normal(n)
+
+            t0 = time.perf_counter()
+            if decoder_name == "bp_pyldpc":
+                dec, act_iter, conv = decode_bp(H, rx, sigma2, MAX_ITER)
+            else:
+                llr = 2.0 * rx / sigma2
+                alpha = ALPHA_FOR_NMS if decoder_name == "nms" else 1.0
+                dec, act_iter, conv = decode_min_sum(H, llr, MAX_ITER,
+                                                     alpha=alpha)
+            decode_time += time.perf_counter() - t0
+
+            if act_iter is not None:
+                iter_sum += act_iter
+                iter_count += 1
+            if not conv:
+                nonconv += 1
+
+            errs = int(np.count_nonzero(dec[:k] != msg))
+            bit_errors += errs
+            frame_errors += int(errs > 0)
+            frames += 1
+
+        sim_time = time.perf_counter() - sim_t0
+        total_info = frames * k
+        ber = bit_errors / total_info if total_info else 0.0
+        fer = frame_errors / frames if frames else 0.0
+        avg_iter = iter_sum / iter_count if iter_count else None
+        ms_per_frame = decode_time / frames * 1000.0 if frames else 0.0
+        throughput = total_info / decode_time if decode_time > 0 else 0.0
+        # The loop stops when either error-count target is reached.
+        reached = (bit_errors >= TARGET_BIT_ERRORS
+                   and frame_errors >= TARGET_FRAME_ERRORS)
+
+        iter_str = f"{avg_iter:.1f}" if avg_iter else "N/A"
+        print(f"  Eb/N0={eb_n0_db:4.1f} dB: BER={ber:.3e}, FER={fer:.3e}, "
+              f"frames={frames}, avg_iter={iter_str}, "
+              f"{ms_per_frame:.2f} ms/frame, "
+              f"{'target reached' if reached else 'MAX_FRAMES'}")
+
+        rows.append({
+            "decoder": decoder_name,
+            "alpha": ALPHA_FOR_NMS if decoder_name == "nms" else None,
+            "eb_n0_db": float(eb_n0_db),
+            "sigma2": float(sigma2),
+            "ber": float(ber),
+            "fer": float(fer),
+            "frames_run": frames,
+            "frame_errors": frame_errors,
+            "bit_errors": bit_errors,
+            "total_info_bits": total_info,
+            "target_reached": bool(reached),
+            "nonconverged_frames": nonconv,
+            "avg_actual_iter": float(avg_iter) if avg_iter else None,
+            "decode_runtime_s": float(decode_time),
+            "simulation_runtime_s": float(sim_time),
+            "runtime_ms_per_frame": float(ms_per_frame),
+            "information_throughput_bit_s": float(throughput),
+            "uncoded_bpsk_theory_ber": float(theoretical_bpsk_ber(eb_n0_db)),
+        })
+    return rows
+
+
+def plot_all(all_rows):
+    by_dec = {}
+    for r in all_rows:
+        by_dec.setdefault(r["decoder"], []).append(r)
+
+    eb = EB_N0_DB_LIST
+    th = theoretical_bpsk_ber(eb)
+    styles = {
+        "bp_pyldpc": ("rs-", "BP (pyldpc)"),
+        "min_sum":   ("go-", "Min-Sum"),
+        "nms":       ("b^-", f"NMS (α={ALPHA_FOR_NMS})"),
+    }
+
+    # ----- BER -----
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.semilogy(eb, th, "k--", lw=1.5, label="Uncoded BPSK (theory)")
+    for name, rows in by_dec.items():
+        x = np.array([r["eb_n0_db"] for r in rows])
+        y = np.array([r["ber"] for r in rows])
+        ax.semilogy(x, np.where(y > 0, y, np.nan),
+                    styles[name][0], lw=1.8, ms=6, label=styles[name][1])
+    ax.axhline(1e-3, color="gray", ls=":", lw=1, alpha=0.7)
+    ax.set_xlabel(r"$E_b/N_0$ (dB)")
+    ax.set_ylabel("BER (information bits)")
+    ax.set_title("Giai đoạn 2 — BER: BP vs Min-Sum vs NMS trên AWGN")
+    ax.grid(True, which="both", ls="--", alpha=0.4)
+    ax.legend()
+    ax.set_ylim([1e-6, 1])
+    fig.tight_layout()
+    p = FIGURE_DIR / "stage2_ber_comparison.png"
+    fig.savefig(p, dpi=250); plt.close(fig)
+    print(f"Figure: {p.resolve()}")
+
+    # ----- FER -----
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for name, rows in by_dec.items():
+        x = np.array([r["eb_n0_db"] for r in rows])
+        y = np.array([r["fer"] for r in rows])
+        ax.semilogy(x, np.where(y > 0, y, np.nan),
+                    styles[name][0], lw=1.8, ms=6, label=styles[name][1])
+    ax.set_xlabel(r"$E_b/N_0$ (dB)")
+    ax.set_ylabel("FER")
+    ax.set_title("Giai đoạn 2 — FER trên AWGN")
+    ax.grid(True, which="both", ls="--", alpha=0.4)
+    ax.legend()
+    fig.tight_layout()
+    p = FIGURE_DIR / "stage2_fer_comparison.png"
+    fig.savefig(p, dpi=250); plt.close(fig)
+    print(f"Figure: {p.resolve()}")
+
+    # ----- Average iterations (chỉ MS, NMS) -----
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for name in ["min_sum", "nms"]:
+        if name not in by_dec:
+            continue
+        rows = by_dec[name]
+        x = np.array([r["eb_n0_db"] for r in rows])
+        y = np.array([r["avg_actual_iter"] if r["avg_actual_iter"]
+                      else np.nan for r in rows])
+        ax.plot(x, y, styles[name][0], lw=1.8, ms=6, label=styles[name][1])
+    ax.set_xlabel(r"$E_b/N_0$ (dB)")
+    ax.set_ylabel("Average actual iterations")
+    ax.set_title("Giai đoạn 2 — Số vòng lặp thực tế (syndrome stopping)")
+    ax.grid(True, ls="--", alpha=0.4)
+    ax.legend()
+    fig.tight_layout()
+    p = FIGURE_DIR / "stage2_avg_iter.png"
+    fig.savefig(p, dpi=250); plt.close(fig)
+    print(f"Figure: {p.resolve()}")
+
+    # ----- Runtime -----
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for name, rows in by_dec.items():
+        x = np.array([r["eb_n0_db"] for r in rows])
+        y = np.array([r["runtime_ms_per_frame"] for r in rows])
+        ax.plot(x, y, styles[name][0], lw=1.8, ms=6, label=styles[name][1])
+    ax.set_xlabel(r"$E_b/N_0$ (dB)")
+    ax.set_ylabel("Runtime (ms/frame)")
+    ax.set_title("Giai đoạn 2 — Runtime trên AWGN")
+    ax.grid(True, ls="--", alpha=0.4)
+    ax.legend()
+    fig.tight_layout()
+    p = FIGURE_DIR / "stage2_runtime.png"
+    fig.savefig(p, dpi=250); plt.close(fig)
+    print(f"Figure: {p.resolve()}")
+
+
+def main():
+    print("=" * 65)
+    print("GIAI ĐOẠN 2 — MS / NMS / BP trên AWGN")
+    print("=" * 65)
+
+    H, G = make_ldpc(N_CODE, D_V, D_C, systematic=True, sparse=True,
+                     seed=SEED)
+    n, k = G.shape
+    rate = k / n
+    print(f"LDPC: H={H.shape}, G={G.shape}, n={n}, k={k}, "
+          f"R={rate:.4f}, MAX_ITER={MAX_ITER}")
+    print(f"NMS alpha = {ALPHA_FOR_NMS}")
+    print(f"Targets: bit_errors={TARGET_BIT_ERRORS}, "
+          f"frame_errors={TARGET_FRAME_ERRORS}, max_frames={MAX_FRAMES}")
+
+    # Exclude one-time library/JIT initialization from reported decode timings.
+    decode_min_sum(H, np.zeros(n, dtype=float), MAX_ITER, alpha=1.0)
+    decode_bp(H, np.ones(n, dtype=float), sigma2=1.0, max_iter=MAX_ITER)
+
+    all_rows = []
+    for name in ["bp_pyldpc", "min_sum", "nms"]:
+        rows = simulate_one_decoder(H, G, rate, name)
+        all_rows.extend(rows)
+
+    save_csv(all_rows, "stage2_decoders_awgn.csv")
+    plot_all(all_rows)
+
+    print("\n" + "=" * 65)
+    print("HOÀN THÀNH GIAI ĐOẠN 2")
+    print("=" * 65)
+    print("\nKỳ vọng:")
+    print("- MS kém BP ~0.3-0.5 dB tại BER=1e-3")
+    print("- NMS alpha=0.8 gần BP hơn MS")
+    print("- Avg iterations cao ở SNR thấp, giảm ở SNR cao")
+    print("- pyldpc KHÔNG trả actual_iter → avg_actual_iter=None cho BP")
+
+
+if __name__ == "__main__":
+    main()
